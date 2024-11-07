@@ -15,7 +15,8 @@ packages <- c("profoc",
               "fable",
               "glmnet",
               "splines",
-              "keras") ## WARNING: keras requires tensorflow to create RNNs- you will likely need to update python and the tensorflow to run the last part of this code (following the prompts should suffice)   
+              "keras", ## WARNING: keras requires tensorflow to create RNNs- you will likely need to update python and the tensorflow to run the last part of this code (following the prompts should suffice)
+              "reticulate")    
 
 for (package in packages) { ## loop for checking if the packages are installed and installing them if necessary
   if (!(package %in% installed.packages()[,1])) {
@@ -170,8 +171,8 @@ cvglmnet_plot <- function(model, x, y) { ## Exclusively used for the holiday log
          title = paste("Cross-Validation Curve with BIC", deparse(substitute(model)))) +
     theme_minimal() +
     geom_line(aes(y = bic * bic_scaling_factor), color = "blue") +
-    scale_y_continuous(name = "Cross-Validation Error (Left)",
-                       sec.axis = sec_axis(~ . / bic_scaling_factor, name = "BIC (Right)"))
+    scale_y_continuous(name = "Cross-Validation Error (Red)",
+                       sec.axis = sec_axis(~ . / bic_scaling_factor, name = "BIC (Blue)"))
   
   return(p)
 }
@@ -762,15 +763,15 @@ Smoothed_BOA_algorithm <- function(model_list, testing_dataframe, horizon = 24, 
 
       if (d > 1) { ## Accesses the previous weights appropriately (aware that if d == 1, we can't access a negative index)
         previous_weights <- t_weights_df[indices_h, d - 1]
+        list_previous_weights <- t_weights_df[, d - 1]
       } else {
         previous_weights <- t_weights_df[indices_h, d]
+        list_previous_weights <- t_weights_df[, d]
       }
       losses_h <- d_instantaneous_regret[indices_h, d] ## Accessing the instantaneous regret for this horizon and day
-      eta <- min((e_range[indices_h]/2),sqrt(log(K)/sum(d_instantaneous_regret[indices_h, 1:d]))) ## Updating the learning rate specific to d_h_k
-      regret[indices_h] <-regret[indices_h] + (losses_h*(eta*losses_h - 1)/2) 
-      new_weights <- previous_weights * exp(-eta * regret[indices_h]) ## Updating of weight d_h_k
-
-      new_weights <- new_weights / sum(new_weights) ## Normalize the weights
+      eta <- min((e_range[indices_h]/2),sqrt(log(K)/sum((d_instantaneous_regret[indices_h, 1:d])^2))) ## Updating the learning rate specific to d_h_k
+      regret[indices_h] <-regret[indices_h] + (losses_h*(eta*losses_h - 1)/2) +  e_range[indices_h]*((-2*eta*regret[indices_h]) > 1)
+      new_weights <- (eta * previous_weights * exp(-eta * regret[indices_h])) / ((1/K)*sum(eta * exp(-eta * regret))) ## Updating of weight d_h_k
       t_weights_df[indices_h, d] <- new_weights ## Updating t_weights_df prior to smoothing
     }
     
@@ -847,6 +848,7 @@ best_lambda <- MAE_lambda %>%
   filter(MAE == min(MAE, na.rm = TRUE)) %>%
   pull(lambda)
 
+
 bestLambda_BOA_application<- Smoothed_BOA_algorithm(model_list = BOA_model_list, ## Creation of a BOA based on optimal lambda from plot
                                          testing_dataframe = Testing_ts,
                                          horizon = 24,
@@ -873,8 +875,8 @@ ifelse(exp(mean(bestLambda_BOA_application$d_h_absoluteError)) < exp(mean(Smooth
        print(paste("The original Smoothed BOA model recorded in Ziel's outperforms the updated lambda model by",
                    exp(mean(Smoothed_BOA_application$d_h_absoluteError)) - exp(mean(bestLambda_BOA_application$d_h_absoluteError)), "kWh error")))
 
-# SECTION 12.0 ATTEMPTING SUGGESTED IMPROVEMENT 2 - RNN REPLACING AR(P)
-## Creation of the new model ensemble replacing AR(P) with Recurrent Neural Networks (RNN)
+# SECTION 12.0 ATTEMPTING SUGGESTED IMPROVEMENT 2 - RNN REPLACING STL_ES
+## Creation of the new model ensemble replacing STL_ES with a Recurrent Neural Network (RNN)
 ## Much of the below code is identical to section 8.0, therefore notation will only be applied to the RNN developement 
 start_time <- Sys.time()
 updatedBOA_model_list <- list()
@@ -882,10 +884,6 @@ subset_days <- c(28, 56, 77, 119, 210, 393, 758)
 subset_lengths <- subset_days * 24
 for (subset_length in subset_lengths) {
   subset_data <- tail(Training_ts, subset_length)
-  ts_data <- ts(subset_data$holiday_adjusted_log_load, frequency = 168)
-  stlm_fit <- stlm(ts_data, s.window = "periodic", method = "ets")
-  model_name <- paste0("STL_ES_", subset_length/24, "days")
-  updatedBOA_model_list[[model_name]] <- stlm_fit
   
   ## RNN model
   timesteps <- 1 ## Means the RNN is built to predict hourly forecasts
@@ -918,7 +916,10 @@ for (subset_length in subset_lengths) {
 
   model_name <- paste0("RNN_", subset_length/24, "days") ## Naming the RNN
   updatedBOA_model_list[[model_name]] <- model ## Saving the RNN model
-
+  
+  ar_fit <- ar(ts_data, aic = TRUE, order.max = 528)
+  model_name <- paste0("ARP_", subset_length/24, "days")
+  updatedBOA_model_list[[model_name]] <- ar_fit
   lag_terms <- paste0("s(log_load_lag_", GAM_lags, ")")
   formula_str <- paste(
     "holiday_adjusted_log_load ~",
@@ -1001,14 +1002,14 @@ updatedBOA_application<- Smoothed_BOA_algorithm(model_list = updatedBOA_model_li
                                                 response_variable = "holiday_adjusted_log_load",
                                                 lambda = 10)
 mean_weights <- list()
-mean_weights$STL_ES <- mean(updatedBOA_application$d_h_k_weights[grepl("^STL_ES_", rownames(updatedBOA_application$d_h_k_weights)), ])
 mean_weights$RNN <- mean(updatedBOA_application$d_h_k_weights[grepl("^RNN_", rownames(updatedBOA_application$d_h_k_weights)), ])
+mean_weights$ARP <- mean(updatedBOA_application$d_h_k_weights[grepl("^ARP_", rownames(updatedBOA_application$d_h_k_weights)), ])
 mean_weights$GAM <- mean(updatedBOA_application$d_h_k_weights[grepl("^GAM_", rownames(updatedBOA_application$d_h_k_weights)), ])
 mean_weights$LASSO <- mean(updatedBOA_application$d_h_k_weights[grepl("^LASSO_", rownames(updatedBOA_application$d_h_k_weights)), ])
 
 ## Print the results
-print(paste("The average weights for STL_ES models =", mean_weights$STL_ES))
 print(paste("The average weights for RNN models =", mean_weights$RNN))
+print(paste("The average weights for AR(P) models =", mean_weights$ARP))
 print(paste("The average weights for GAM models =", mean_weights$GAM))
 print(paste("The average weights for LASSO models =", mean_weights$LASSO))
 lowest_contribution_model <- names(mean_weights)[which.min(unlist(mean_weights))]
